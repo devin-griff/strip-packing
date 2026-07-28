@@ -297,18 +297,7 @@ def _solve_capturing(m, transform, solver_name="appsi_highs",
             tc, gap_pct = _run_gurobi(m, time_limit_s)
         else:
             tc, gap_pct = _run_highs(m, time_limit_s)
-    # Scrub license-identifying lines from the captured log before it
-    # reaches the public Logs tab: Gurobi's WLS banner prints the
-    # license ID and registrant ("WLS license NNNNNNN - registered to
-    # ..."). Substring match keeps this robust to wording shifts across
-    # Gurobi versions; HiGHS logs never match.
-    log_text = "\n".join(
-        ln for ln in buf.getvalue().splitlines()
-        if not any(
-            marker in ln.lower()
-            for marker in ("wls", "registered to", "academic license")
-        )
-    )
+    log_text = buf.getvalue()
     elapsed = time.perf_counter() - t0
     return tc, gap_pct, log_text, elapsed
 
