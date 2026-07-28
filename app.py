@@ -249,7 +249,7 @@ def build_model(data):
 # surfaces the optimality gap when the solver doesn't converge. The user
 # can raise the cap via the Time limit select on the Optimizer tab -
 # bounded at 60 s so a public visitor can't pin the page (and, with
-# solves serialized behind _SOLVE_LOCK, everyone else's solves) for
+# solves serialized behind the solve lock, everyone else's solves) for
 # minutes.
 SOLVE_TIME_LIMIT_S = 10.0
 _TIME_LIMITS = {"10": 10.0, "30": 30.0, "60": 60.0}
@@ -263,8 +263,13 @@ GAP_OPTIMAL_THRESHOLD_PCT = 0.05
 # One solve at a time per machine: every Streamlit session runs app.py in
 # its own thread of this one process, and the solver-log capture redirects
 # process-global stdout. Overlapping captures corrupt each other and fail
-# both solves, so every solve serializes behind this lock.
-_SOLVE_LOCK = threading.Lock()
+# both solves, so every solve serializes behind one process-wide lock.
+# The lock must come from st.cache_resource: Streamlit re-executes this
+# script per rerun in a fresh namespace, so a bare module-level Lock
+# would be a new object every rerun and would serialize nothing.
+@st.cache_resource(show_spinner=False)
+def _solve_lock():
+    return threading.Lock()
 
 
 class _LicenseBusyError(RuntimeError):
@@ -301,7 +306,7 @@ def _solve_capturing(m, transform, solver_name="appsi_highs",
     pyo.TransformationFactory(transform).apply_to(m)
 
     buf = io.StringIO()
-    with _SOLVE_LOCK, contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+    with _solve_lock(), contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
         if solver_name == "appsi_gurobi":
             tc, gap_pct = _run_gurobi(m, time_limit_s)
         else:
