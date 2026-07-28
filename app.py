@@ -38,6 +38,7 @@ import io
 import math
 import os
 import random
+import threading
 import time
 from pathlib import Path
 
@@ -247,8 +248,9 @@ def build_model(data):
 # than this in the worst case; cutting off keeps the UI responsive and
 # surfaces the optimality gap when the solver doesn't converge. The user
 # can raise the cap via the Time limit select on the Optimizer tab -
-# bounded at 60 s so a public visitor can't pin the page (or a Gurobi
-# WLS seat) for minutes.
+# bounded at 60 s so a public visitor can't pin the page (and, with
+# solves serialized behind _SOLVE_LOCK, everyone else's solves) for
+# minutes.
 SOLVE_TIME_LIMIT_S = 10.0
 _TIME_LIMITS = {"10": 10.0, "30": 30.0, "60": 60.0}
 
@@ -256,6 +258,13 @@ _TIME_LIMITS = {"10": 10.0, "30": 30.0, "60": 60.0}
 # default HiGHS MIP gap tolerance is 0.01% = 1e-4; we use a tiny bit
 # higher to absorb floating-point noise).
 GAP_OPTIMAL_THRESHOLD_PCT = 0.05
+
+
+# One solve at a time per machine: every Streamlit session runs app.py in
+# its own thread of this one process, and the solver-log capture redirects
+# process-global stdout. Overlapping captures corrupt each other and fail
+# both solves, so every solve serializes behind this lock.
+_SOLVE_LOCK = threading.Lock()
 
 
 class _LicenseBusyError(RuntimeError):
@@ -292,7 +301,7 @@ def _solve_capturing(m, transform, solver_name="appsi_highs",
     pyo.TransformationFactory(transform).apply_to(m)
 
     buf = io.StringIO()
-    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+    with _SOLVE_LOCK, contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
         if solver_name == "appsi_gurobi":
             tc, gap_pct = _run_gurobi(m, time_limit_s)
         else:
@@ -323,39 +332,30 @@ def _run_gurobi(m, time_limit_s=SOLVE_TIME_LIMIT_S):
     (termination_condition mapped onto the legacy enum, gap_pct);
     solution loaded onto m when an incumbent exists.
 
-    Gurobi checks out a WLS license seat when its environment starts.
-    The license allows a small number of concurrent sessions and seats
-    churn in seconds, so one checkout collision gets a quiet retry
-    before surfacing as license_busy: and the seat is ALWAYS released
-    afterward, since holding it would pin license capacity to this
-    machine between solves. (The seat is held for the duration of the
-    solve, which is why the user-selectable time limit is bounded.)"""
+    The first solve after a machine wakes checks out the WLS session; the
+    session is then held for the process lifetime (hold while awake), so
+    later solves skip the checkout round trip. A checkout collision gets
+    one quiet retry before surfacing as license_busy."""
     from pyomo.contrib.appsi.solvers import Gurobi as AppsiGurobi
 
     opt = AppsiGurobi()
     opt.config.time_limit = time_limit_s
     opt.config.load_solution = False
     opt.config.stream_solver = True  # log into the redirected stdout
-    try:
-        for attempt in (1, 2):
-            try:
-                res = opt.solve(m)
-                break
-            except Exception as e:
-                lowered = str(e).lower()
-                if "license" in lowered or "wls" in lowered:
-                    if attempt == 1:
-                        time.sleep(2.0)
-                        continue
-                    raise _LicenseBusyError(str(e)) from e
-                raise
-        if res.best_feasible_objective is not None:
-            res.solution_loader.load_vars()
-    finally:
+    for attempt in (1, 2):
         try:
-            opt.release_license()
-        except Exception:
-            pass
+            res = opt.solve(m)
+            break
+        except Exception as e:
+            lowered = str(e).lower()
+            if "license" in lowered or "wls" in lowered:
+                if attempt == 1:
+                    time.sleep(2.0)
+                    continue
+                raise _LicenseBusyError(str(e)) from e
+            raise
+    if res.best_feasible_objective is not None:
+        res.solution_loader.load_vars()
 
     # Map the appsi TerminationCondition onto the legacy enum solve()
     # branches on: the member names match for everything we handle
